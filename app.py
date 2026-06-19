@@ -1,12 +1,15 @@
 import os
 import tempfile
 import warnings
+import uuid
+from datetime import datetime
 import numpy as np
 import pandas as pd
 import gradio as gr
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 
 from data_handler import parse_csv, get_basic_statistics, generate_time_series_preview, validate_column_selection
 from preprocessing import (
@@ -53,6 +56,8 @@ class AnalysisState:
         self.stability_info = None
         self.corrected_granger = None
         self.ms_results = None
+        self.snapshots = []
+        self.last_preprocess_params = None
 
     def reset(self):
         self.__init__()
@@ -156,6 +161,12 @@ def on_preprocess(missing_strategy, standardize, diff_order, skip_stationarity):
         state.processed_df = df
 
     state.adf_results = adf_results
+    state.last_preprocess_params = {
+        "missing_strategy": missing_strategy,
+        "standardize": standardize,
+        "diff_order": diff_order,
+        "skip_stationarity": skip_stationarity
+    }
 
     fig_adf = generate_adf_summary_plot(adf_df)
 
@@ -499,6 +510,487 @@ def on_generate_report():
         return f"Error generating report: {str(e)}"
 
 
+def _method_display_name(method_key):
+    names = {
+        "bivariate_granger": "Bivariate Granger",
+        "multivariate_granger": "Multivariate Granger",
+        "pcmci": "PCMCI",
+        "transfer_entropy": "Transfer Entropy"
+    }
+    return names.get(method_key, method_key)
+
+
+def _flatten_params(snapshot):
+    flat = {}
+    flat["Variables"] = ", ".join(snapshot["variables"])
+    flat["Missing Strategy"] = snapshot["preprocessing"]["missing_strategy"]
+    flat["Standardization"] = snapshot["preprocessing"]["standardize"]
+    flat["Differencing Order"] = str(snapshot["preprocessing"]["diff_order"])
+    flat["Skip Stationarity"] = str(snapshot["preprocessing"]["skip_stationarity"])
+
+    params = snapshot["parameters"]
+    if snapshot["method"] == "bivariate_granger":
+        flat["Max Lag"] = str(params.get("max_lag", ""))
+        flat["Criterion"] = params.get("criterion", "")
+        flat["Manual Lag"] = str(params.get("manual_lag", "auto"))
+    elif snapshot["method"] == "multivariate_granger":
+        flat["Max Lag"] = str(params.get("max_lag", ""))
+        flat["Criterion"] = params.get("criterion", "")
+    elif snapshot["method"] == "pcmci":
+        flat["Tau Max"] = str(params.get("tau_max", ""))
+        flat["Alpha"] = str(params.get("alpha", ""))
+        flat["CI Test"] = params.get("ci_test", "")
+    elif snapshot["method"] == "transfer_entropy":
+        flat["Embedding Dim"] = str(params.get("embedding_dim", ""))
+        flat["K Neighbors"] = str(params.get("k_neighbors", ""))
+        flat["N Surrogates"] = str(params.get("n_surrogates", ""))
+
+    return flat
+
+
+def _create_snapshot(label, method, parameters):
+    snapshot = {
+        "id": str(uuid.uuid4())[:8],
+        "label": label,
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "method": method,
+        "variables": list(state.selected_cols),
+        "preprocessing": dict(state.last_preprocess_params) if state.last_preprocess_params else {},
+        "parameters": parameters,
+        "results": []
+    }
+    return snapshot
+
+
+def save_snapshot_bivariate(label, max_lag, criterion, manual_lag):
+    if not label or not label.strip():
+        return "Please enter a snapshot label", gr.update(choices=[]), gr.update(choices=[])
+    label = label.strip()
+
+    if state.granger_results is None:
+        return "Run the test first before saving a snapshot.", gr.update(choices=[]), gr.update(choices=[])
+
+    params = {
+        "max_lag": int(max_lag),
+        "criterion": criterion,
+        "manual_lag": int(manual_lag) if manual_lag and int(manual_lag) > 0 else "auto"
+    }
+    snapshot = _create_snapshot(label, "bivariate_granger", params)
+
+    for _, row in state.granger_results.iterrows():
+        snapshot["results"].append({
+            "cause": row["cause"],
+            "effect": row["effect"],
+            "statistic": float(row["f_statistic"]) if pd.notna(row["f_statistic"]) else None,
+            "p_value": float(row["f_pvalue"]) if pd.notna(row["f_pvalue"]) else None,
+            "is_significant": bool(row["is_significant"]) if row["is_significant"] is not None else None
+        })
+
+    state.snapshots.append(snapshot)
+    choices = _get_snapshot_choices()
+    pair_options = _get_all_pair_options()
+    return (f"Snapshot '{label}' saved! ({len(state.snapshots)} total)",
+            gr.update(choices=choices, value=[]),
+            gr.update(choices=pair_options, value=None))
+
+
+def save_snapshot_multivariate(label, max_lag, criterion):
+    if not label or not label.strip():
+        return "Please enter a snapshot label", gr.update(choices=[]), gr.update(choices=[])
+    label = label.strip()
+
+    if state.multivar_results is None:
+        return "Run the test first before saving a snapshot.", gr.update(choices=[]), gr.update(choices=[])
+
+    params = {
+        "max_lag": int(max_lag),
+        "criterion": criterion
+    }
+    snapshot = _create_snapshot(label, "multivariate_granger", params)
+
+    for _, row in state.multivar_results.iterrows():
+        snapshot["results"].append({
+            "cause": row["cause"],
+            "effect": row["effect"],
+            "statistic": float(row["wald_statistic"]) if pd.notna(row["wald_statistic"]) else None,
+            "p_value": float(row["wald_pvalue"]) if pd.notna(row["wald_pvalue"]) else None,
+            "is_significant": bool(row["is_significant"]) if row["is_significant"] is not None else None
+        })
+
+    state.snapshots.append(snapshot)
+    choices = _get_snapshot_choices()
+    pair_options = _get_all_pair_options()
+    return (f"Snapshot '{label}' saved! ({len(state.snapshots)} total)",
+            gr.update(choices=choices, value=[]),
+            gr.update(choices=pair_options, value=None))
+
+
+def save_snapshot_pcmci(label, tau_max, alpha, ci_test):
+    if not label or not label.strip():
+        return "Please enter a snapshot label", gr.update(choices=[]), gr.update(choices=[])
+    label = label.strip()
+
+    if state.pcmci_edges is None:
+        return "Run the algorithm first before saving a snapshot.", gr.update(choices=[]), gr.update(choices=[])
+
+    params = {
+        "tau_max": int(tau_max),
+        "alpha": float(alpha),
+        "ci_test": ci_test
+    }
+    snapshot = _create_snapshot(label, "pcmci", params)
+
+    all_pairs = []
+    for v1 in state.selected_cols:
+        for v2 in state.selected_cols:
+            if v1 != v2:
+                all_pairs.append((v1, v2))
+    edge_keys = set()
+    for e in state.pcmci_edges:
+        edge_keys.add((e["source"], e["target"]))
+
+    for cause, effect in all_pairs:
+        if (cause, effect) in edge_keys:
+            e = next(e for e in state.pcmci_edges if e["source"] == cause and e["target"] == effect)
+            snapshot["results"].append({
+                "cause": cause,
+                "effect": effect,
+                "statistic": float(e.get("strength")) if e.get("strength") is not None else None,
+                "p_value": float(e.get("p_value")) if e.get("p_value") is not None else None,
+                "is_significant": True
+            })
+        else:
+            snapshot["results"].append({
+                "cause": cause,
+                "effect": effect,
+                "statistic": None,
+                "p_value": None,
+                "is_significant": False
+            })
+
+    state.snapshots.append(snapshot)
+    choices = _get_snapshot_choices()
+    pair_options = _get_all_pair_options()
+    return (f"Snapshot '{label}' saved! ({len(state.snapshots)} total)",
+            gr.update(choices=choices, value=[]),
+            gr.update(choices=pair_options, value=None))
+
+
+def save_snapshot_transfer_entropy(label, embedding_dim, k_neighbors, n_surrogates):
+    if not label or not label.strip():
+        return "Please enter a snapshot label", gr.update(choices=[]), gr.update(choices=[])
+    label = label.strip()
+
+    if state.te_results is None:
+        return "Run the analysis first before saving a snapshot.", gr.update(choices=[]), gr.update(choices=[])
+
+    params = {
+        "embedding_dim": int(embedding_dim),
+        "k_neighbors": int(k_neighbors),
+        "n_surrogates": int(n_surrogates)
+    }
+    snapshot = _create_snapshot(label, "transfer_entropy", params)
+
+    for r in state.te_results:
+        snapshot["results"].append({
+            "cause": r["source"],
+            "effect": r["target"],
+            "statistic": float(r["transfer_entropy"]),
+            "p_value": float(r["p_value"]),
+            "is_significant": bool(r["is_significant"])
+        })
+
+    state.snapshots.append(snapshot)
+    choices = _get_snapshot_choices()
+    pair_options = _get_all_pair_options()
+    return (f"Snapshot '{label}' saved! ({len(state.snapshots)} total)",
+            gr.update(choices=choices, value=[]),
+            gr.update(choices=pair_options, value=None))
+
+
+def _get_snapshot_choices():
+    choices = []
+    for i, s in enumerate(state.snapshots):
+        display = f"{s['label']} [{_method_display_name(s['method'])}] - {s['timestamp']}"
+        choices.append((display, i))
+    return choices
+
+
+def _get_all_pair_options():
+    all_pairs = set()
+    for s in state.snapshots:
+        for r in s["results"]:
+            pair_key = f"{r['cause']} -> {r['effect']}"
+            all_pairs.add(pair_key)
+    return sorted(list(all_pairs))
+
+
+def _indices_from_selected(selected_values):
+    if not selected_values:
+        return []
+    indices = []
+    for v in selected_values:
+        try:
+            indices.append(int(v))
+        except (ValueError, TypeError):
+            pass
+    return sorted(indices)
+
+
+def get_snapshot_list():
+    choices = _get_snapshot_choices()
+    return gr.update(choices=choices, value=[])
+
+
+def delete_snapshot(selected_values):
+    indices = _indices_from_selected(selected_values)
+    if not indices:
+        choices = _get_snapshot_choices()
+        return "No snapshot selected for deletion", gr.update(choices=choices, value=[]), gr.update(choices=[], value=None), gr.HTML("<p style='color: #888;'>Select 2-4 snapshots to compare parameters</p>"), None, None
+
+    indices_to_remove = sorted(indices, reverse=True)
+    deleted_labels = []
+    for idx in indices_to_remove:
+        if 0 <= idx < len(state.snapshots):
+            deleted_labels.append(state.snapshots[idx]["label"])
+            del state.snapshots[idx]
+
+    choices = _get_snapshot_choices()
+    pair_options = _get_all_pair_options()
+
+    return (f"Deleted snapshot(s): {', '.join(deleted_labels)}",
+            gr.update(choices=choices, value=[]),
+            gr.update(choices=pair_options, value=None),
+            gr.HTML("<p style='color: #888;'>Select 2-4 snapshots to compare parameters</p>"),
+            None, None)
+
+
+def clear_all_snapshots():
+    count = len(state.snapshots)
+    state.snapshots.clear()
+    return (f"Cleared {count} snapshot(s)",
+            gr.update(choices=[], value=[]),
+            gr.update(choices=[], value=None),
+            gr.HTML("<p style='color: #888;'>Select 2-4 snapshots to compare parameters</p>"),
+            None, None)
+
+
+def get_param_diff_html(selected_indices):
+    if not selected_indices or len(selected_indices) < 2:
+        return "<p style='color: #888;'>Please select 2-4 snapshots to compare</p>"
+
+    selected_snapshots = [state.snapshots[i] for i in selected_indices if i < len(state.snapshots)]
+    if len(selected_snapshots) < 2:
+        return "<p style='color: #888;'>Please select 2-4 snapshots to compare</p>"
+
+    all_params = [_flatten_params(s) for s in selected_snapshots]
+    param_keys = set()
+    for p in all_params:
+        param_keys.update(p.keys())
+    param_keys = sorted(param_keys)
+
+    html = "<div style='overflow-x: auto;'>"
+    html += "<table style='width: 100%; border-collapse: collapse; font-size: 13px;'>"
+    html += "<thead><tr><th style='padding: 8px; border: 1px solid #ddd; background: #f0f0f0; text-align: left;'>Parameter</th>"
+    for s in selected_snapshots:
+        html += f"<th style='padding: 8px; border: 1px solid #ddd; background: #f0f0f0; text-align: center;'>{s['label']}</th>"
+    html += "</tr></thead><tbody>"
+
+    for key in param_keys:
+        values = [p.get(key, "-") for p in all_params]
+        all_same = len(set(values)) == 1
+        bg_style = "background: #f5f5f5; color: #888;" if all_same else "background: #fff9c4;"
+
+        html += f"<tr><td style='padding: 8px; border: 1px solid #ddd; font-weight: 500;'>{key}</td>"
+        for v in values:
+            html += f"<td style='padding: 8px; border: 1px solid #ddd; text-align: center; {bg_style}'>{v}</td>"
+        html += "</tr>"
+
+    html += "</tbody></table></div>"
+    html += "<p style='font-size: 12px; color: #666; margin-top: 8px;'><span style='display: inline-block; width: 12px; height: 12px; background: #f5f5f5; border: 1px solid #ddd; margin-right: 4px;'></span> Same value &nbsp;&nbsp;"
+    html += "<span style='display: inline-block; width: 12px; height: 12px; background: #fff9c4; border: 1px solid #ddd; margin-right: 4px;'></span> Different value</p>"
+
+    return html
+
+
+def get_consistency_matrix_plot(selected_indices):
+    if not selected_indices or len(selected_indices) < 2:
+        return None
+
+    selected_snapshots = [state.snapshots[i] for i in selected_indices if i < len(state.snapshots)]
+    if len(selected_snapshots) < 2:
+        return None
+
+    all_pairs = set()
+    for s in selected_snapshots:
+        for r in s["results"]:
+            all_pairs.add(f"{r['cause']} -> {r['effect']}")
+    all_pairs = sorted(list(all_pairs))
+
+    if not all_pairs:
+        return None
+
+    n_pairs = len(all_pairs)
+    n_snaps = len(selected_snapshots)
+
+    pair_to_idx = {p: i for i, p in enumerate(all_pairs)}
+
+    matrix = np.zeros((n_snaps, n_pairs))
+    for si, s in enumerate(selected_snapshots):
+        result_map = {}
+        for r in s["results"]:
+            key = f"{r['cause']} -> {r['effect']}"
+            result_map[key] = r["is_significant"]
+        for pi, pair in enumerate(all_pairs):
+            sig = result_map.get(pair, None)
+            if sig is True:
+                matrix[si, pi] = 1
+            elif sig is False:
+                matrix[si, pi] = 0
+            else:
+                matrix[si, pi] = -1
+
+    fig, ax = plt.subplots(figsize=(max(8, n_pairs * 0.6), max(4, n_snaps * 0.8)))
+
+    cmap = plt.cm.colors.ListedColormap(['#cccccc', '#ef5350', '#66bb6a'])
+    bounds = [-1.5, -0.5, 0.5, 1.5]
+    norm = plt.cm.colors.BoundaryNorm(bounds, cmap.N)
+
+    im = ax.imshow(matrix, cmap=cmap, norm=norm, aspect='auto', interpolation='nearest')
+
+    ax.set_xticks(range(n_pairs))
+    ax.set_xticklabels(all_pairs, rotation=45, ha='right', fontsize=9)
+    ax.set_yticks(range(n_snaps))
+    ax.set_yticklabels([s['label'] for s in selected_snapshots], fontsize=10)
+    ax.set_title("Causal Relationship Consistency Matrix", fontsize=12, fontweight='bold', pad=15)
+
+    for i in range(n_snaps):
+        for j in range(n_pairs):
+            val = matrix[i, j]
+            if val == 1:
+                text = "✓"
+                color = "white"
+            elif val == 0:
+                text = "✗"
+                color = "white"
+            else:
+                text = "?"
+                color = "#666"
+            ax.text(j, i, text, ha='center', va='center', color=color, fontsize=10, fontweight='bold')
+
+    legend_patches = [
+        mpatches.Patch(color='#66bb6a', label='Significant'),
+        mpatches.Patch(color='#ef5350', label='Not significant'),
+        mpatches.Patch(color='#cccccc', label='Not tested')
+    ]
+    ax.legend(handles=legend_patches, loc='upper left', bbox_to_anchor=(1.02, 1), fontsize=9)
+
+    plt.tight_layout()
+    return fig
+
+
+def get_statistic_trend_plot(selected_values, pair_selection):
+    indices = _indices_from_selected(selected_values)
+    if not indices or len(indices) < 2 or not pair_selection:
+        return None
+
+    selected_snapshots = [state.snapshots[i] for i in indices if i < len(state.snapshots)]
+    if len(selected_snapshots) < 2:
+        return None
+
+    parts = pair_selection.split("->")
+    if len(parts) != 2:
+        return None
+    cause = parts[0].strip()
+    effect = parts[1].strip()
+
+    snap_labels = []
+    statistics = []
+    p_values = []
+    has_data = False
+
+    for s in selected_snapshots:
+        snap_labels.append(s["label"])
+        found = False
+        for r in s["results"]:
+            if r["cause"] == cause and r["effect"] == effect:
+                statistics.append(r["statistic"] if r["statistic"] is not None else 0)
+                p_values.append(r["p_value"] if r["p_value"] is not None else None)
+                found = True
+                if r["statistic"] is not None:
+                    has_data = True
+                break
+        if not found:
+            statistics.append(0)
+            p_values.append(None)
+
+    if not has_data:
+        return None
+
+    fig, ax = plt.subplots(figsize=(max(6, len(snap_labels) * 1.2), 6))
+
+    colors = []
+    for pv in p_values:
+        if pv is not None and pv < 0.05:
+            colors.append('#66bb6a')
+        elif pv is not None:
+            colors.append('#ef5350')
+        else:
+            colors.append('#cccccc')
+
+    x_pos = range(len(snap_labels))
+    bars = ax.bar(x_pos, statistics, color=colors, edgecolor='#333', linewidth=0.5)
+
+    for i, (bar, pv) in enumerate(zip(bars, p_values)):
+        height = bar.get_height()
+        if pv is not None:
+            label = f"p={pv:.4f}"
+        else:
+            label = "N/A"
+        ax.text(bar.get_x() + bar.get_width() / 2., height + (max(statistics) * 0.02 if max(statistics) > 0 else 0.1),
+                label, ha='center', va='bottom', fontsize=9)
+
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels(snap_labels, rotation=30, ha='right', fontsize=10)
+    ax.set_ylabel("Test Statistic", fontsize=11)
+    ax.set_title(f"Statistic Trend: {cause} → {effect}", fontsize=12, fontweight='bold', pad=15)
+    ax.set_ylim(0, max(statistics) * 1.2 if max(statistics) > 0 else 1)
+
+    legend_patches = [
+        mpatches.Patch(color='#66bb6a', label='Significant (p<0.05)'),
+        mpatches.Patch(color='#ef5350', label='Not significant'),
+        mpatches.Patch(color='#cccccc', label='No data')
+    ]
+    ax.legend(handles=legend_patches, loc='upper right', fontsize=9)
+
+    plt.tight_layout()
+    return fig
+
+
+def on_compare_selected(selected_values):
+    indices = _indices_from_selected(selected_values)
+    if not indices or len(indices) < 2:
+        return ("<p style='color: #888;'>Please select 2-4 snapshots to compare</p>",
+                None, None, gr.update(choices=[], value=None))
+
+    selected_count = len(indices)
+    if selected_count > 4:
+        return ("<p style='color: #e74c3c;'>Please select at most 4 snapshots for comparison</p>",
+                None, None, gr.update(choices=[], value=None))
+
+    param_html = get_param_diff_html(indices)
+    consistency_fig = get_consistency_matrix_plot(indices)
+
+    pair_options = _get_all_pair_options()
+    first_pair = pair_options[0] if pair_options else None
+
+    trend_fig = None
+    if first_pair:
+        trend_fig = get_statistic_trend_plot(indices, first_pair)
+
+    return param_html, consistency_fig, trend_fig, gr.update(choices=pair_options, value=first_pair)
+
+
 def build_app():
     with gr.Blocks(
         title="Causal Time Series Analysis",
@@ -597,6 +1089,11 @@ def build_app():
                                 )
                                 manual_lag = gr.Number(label="Manual Lag (0=auto)", value=0)
                                 bio_btn = gr.Button("Run Bivariate Granger Test", variant="primary")
+                                gr.Markdown("---")
+                                gr.Markdown("### Save Snapshot")
+                                bio_snap_label = gr.Textbox(label="Snapshot Label", placeholder="e.g., lag5_aic")
+                                bio_snap_btn = gr.Button("Save Snapshot", variant="secondary")
+                                bio_snap_status = gr.Textbox(label="Status", interactive=False, lines=2)
                             with gr.Column(scale=2):
                                 bio_info = gr.Textbox(label="Results", lines=12, interactive=False)
                         with gr.Row():
@@ -629,6 +1126,11 @@ def build_app():
                                     value="aic"
                                 )
                                 multi_btn = gr.Button("Run Multivariate Granger Test", variant="primary")
+                                gr.Markdown("---")
+                                gr.Markdown("### Save Snapshot")
+                                multi_snap_label = gr.Textbox(label="Snapshot Label", placeholder="e.g., multi_lag5")
+                                multi_snap_btn = gr.Button("Save Snapshot", variant="secondary")
+                                multi_snap_status = gr.Textbox(label="Status", interactive=False, lines=2)
                             with gr.Column(scale=2):
                                 multi_info = gr.Textbox(label="Results", lines=14, interactive=False)
                         multi_plot = gr.Plot(label="Multivariate Wald Test Heatmap")
@@ -680,6 +1182,11 @@ def build_app():
                         te_k = gr.Slider(2, 20, value=4, step=1, label="K-Nearest Neighbors")
                         te_surrogates = gr.Slider(50, 500, value=100, step=50, label="Number of Surrogates")
                         te_btn = gr.Button("Run Transfer Entropy Analysis", variant="primary")
+                        gr.Markdown("---")
+                        gr.Markdown("### Save Snapshot")
+                        te_snap_label = gr.Textbox(label="Snapshot Label", placeholder="e.g., te_dim2_k4")
+                        te_snap_btn = gr.Button("Save Snapshot", variant="secondary")
+                        te_snap_status = gr.Textbox(label="Status", interactive=False, lines=2)
                     with gr.Column(scale=2):
                         te_info = gr.Textbox(label="Results", lines=14, interactive=False)
                 te_plot = gr.Plot(label="Transfer Entropy Heatmap")
@@ -701,6 +1208,11 @@ def build_app():
                             value="parcorr"
                         )
                         pcmci_btn = gr.Button("Run PCMCI Algorithm", variant="primary")
+                        gr.Markdown("---")
+                        gr.Markdown("### Save Snapshot")
+                        pcmci_snap_label = gr.Textbox(label="Snapshot Label", placeholder="e.g., pcmci_tau5_alpha05")
+                        pcmci_snap_btn = gr.Button("Save Snapshot", variant="secondary")
+                        pcmci_snap_status = gr.Textbox(label="Status", interactive=False, lines=2)
                     with gr.Column(scale=2):
                         pcmci_info = gr.Textbox(label="Results", lines=14, interactive=False)
                 pcmci_graph = gr.Plot(label="PCMCI Causal Directed Graph")
@@ -778,6 +1290,57 @@ def build_app():
                     outputs=[ms_info, ms_plot]
                 )
 
+            with gr.Tab("Snapshot Compare"):
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        gr.Markdown("### Saved Snapshots")
+                        gr.Markdown("Select 2-4 snapshots to compare")
+                        snap_list = gr.CheckboxGroup(
+                            label="Snapshots",
+                            choices=[],
+                            value=[]
+                        )
+                        with gr.Row():
+                            snap_compare_btn = gr.Button("Compare Selected", variant="primary", scale=2)
+                            snap_delete_btn = gr.Button("Delete", variant="stop", scale=1)
+                        snap_clear_btn = gr.Button("Clear All Snapshots", variant="secondary")
+                        snap_status = gr.Textbox(label="Status", interactive=False, lines=3)
+                    with gr.Column(scale=3):
+                        with gr.Tabs():
+                            with gr.Tab("Parameter Differences"):
+                                param_diff_html = gr.HTML(
+                                    value="<p style='color: #888;'>Select 2-4 snapshots to compare parameters</p>"
+                                )
+                            with gr.Tab("Consistency Matrix"):
+                                consistency_plot = gr.Plot(label="Causal Relationship Consistency")
+                            with gr.Tab("Statistic Trend"):
+                                trend_pair_selector = gr.Dropdown(
+                                    label="Select Variable Pair",
+                                    choices=[],
+                                    value=None
+                                )
+                                trend_plot = gr.Plot(label="Test Statistic Trend")
+
+                snap_compare_btn.click(
+                    fn=on_compare_selected,
+                    inputs=[snap_list],
+                    outputs=[param_diff_html, consistency_plot, trend_plot, trend_pair_selector]
+                )
+                snap_delete_btn.click(
+                    fn=delete_snapshot,
+                    inputs=[snap_list],
+                    outputs=[snap_status, snap_list, trend_pair_selector, param_diff_html, consistency_plot, trend_plot]
+                )
+                snap_clear_btn.click(
+                    fn=clear_all_snapshots,
+                    outputs=[snap_status, snap_list, trend_pair_selector, param_diff_html, consistency_plot, trend_plot]
+                )
+                trend_pair_selector.change(
+                    fn=get_statistic_trend_plot,
+                    inputs=[snap_list, trend_pair_selector],
+                    outputs=[trend_plot]
+                )
+
             with gr.Tab("Report Export"):
                 with gr.Row():
                     with gr.Column():
@@ -799,6 +1362,27 @@ def build_app():
                 report_btn.click(
                     fn=on_generate_report,
                     outputs=[report_file]
+                )
+
+                bio_snap_btn.click(
+                    fn=save_snapshot_bivariate,
+                    inputs=[bio_snap_label, max_lag_bio, criterion_bio, manual_lag],
+                    outputs=[bio_snap_status, snap_list, trend_pair_selector]
+                )
+                multi_snap_btn.click(
+                    fn=save_snapshot_multivariate,
+                    inputs=[multi_snap_label, max_lag_multi, criterion_multi],
+                    outputs=[multi_snap_status, snap_list, trend_pair_selector]
+                )
+                te_snap_btn.click(
+                    fn=save_snapshot_transfer_entropy,
+                    inputs=[te_snap_label, te_embed_dim, te_k, te_surrogates],
+                    outputs=[te_snap_status, snap_list, trend_pair_selector]
+                )
+                pcmci_snap_btn.click(
+                    fn=save_snapshot_pcmci,
+                    inputs=[pcmci_snap_label, pcmci_tau, pcmci_alpha, pcmci_ci],
+                    outputs=[pcmci_snap_status, snap_list, trend_pair_selector]
                 )
 
     return app
