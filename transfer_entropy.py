@@ -20,9 +20,12 @@ def _ksg_conditional_mutual_info(x, y, z, k=4):
     if n <= k + 1:
         return 0.0
 
-    x = x.reshape(-1, 1)
-    y = y.reshape(-1, 1)
-    z = z.reshape(-1, 1) if z is not None else None
+    if x.ndim == 1:
+        x = x.reshape(-1, 1)
+    if y.ndim == 1:
+        y = y.reshape(-1, 1)
+    if z is not None and z.ndim == 1:
+        z = z.reshape(-1, 1)
 
     if z is not None:
         xz = np.hstack([x, z])
@@ -53,19 +56,25 @@ def compute_transfer_entropy(source, target, embedding_dim=1, k=4, lag=1):
     if max_start <= k + 1:
         return 0.0
 
-    target_future = target[lag + embedding_dim:]
+    target_future = target[lag + embedding_dim: n]
     target_past_list = []
     source_past_list = []
 
     for d in range(embedding_dim):
-        target_past_list.append(target[lag + d: lag + d + max_start])
-        source_past_list.append(source[d: d + max_start])
+        tp = target[lag + d: lag + d + max_start]
+        sp = source[d: d + max_start]
+        target_past_list.append(tp)
+        source_past_list.append(sp)
 
-    target_future = target_future[:max_start]
     target_past = np.column_stack(target_past_list)
     source_past = np.column_stack(source_past_list)
 
-    te = _ksg_conditional_mutual_info(source_past, target_future.reshape(-1, 1), target_past, k=k)
+    min_len = min(len(target_future), len(target_past), len(source_past))
+    target_future = target_future[:min_len]
+    target_past = target_past[:min_len]
+    source_past = source_past[:min_len]
+
+    te = _ksg_conditional_mutual_info(source_past, target_future, target_past, k=k)
     return te
 
 

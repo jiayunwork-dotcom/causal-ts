@@ -107,6 +107,16 @@ def multivariate_granger_test(df, selected_cols, max_lag, criterion="aic"):
 
     wald_results = []
     n_vars = len(selected_cols)
+    p = optimal_lag
+    k = n_vars
+
+    try:
+        params = fitted.params.values
+        cov_params = fitted.cov_params()
+        resid = fitted.resid.values
+        n_obs = len(resid)
+    except Exception as e:
+        return None, f"Cannot extract model parameters: {str(e)}"
 
     for i in range(n_vars):
         for j in range(n_vars):
@@ -115,37 +125,38 @@ def multivariate_granger_test(df, selected_cols, max_lag, criterion="aic"):
             cause_idx = j
             effect_idx = i
 
-            coef_matrix = fitted.coefs
-            cause_coefs = coef_matrix[:, effect_idx, cause_idx]
-
-            if hasattr(fitted, "cov_params"):
-                try:
-                    cov = fitted.cov_params()
-                    k = n_vars
-                    p = optimal_lag
-                    param_indices = []
-                    for lag_idx in range(p):
-                        row = effect_idx
-                        col = lag_idx * k + cause_idx
-                        flat_idx = row * (k * p) + col
+            try:
+                param_indices = []
+                for lag_idx in range(p):
+                    row = 1 + lag_idx * k + cause_idx
+                    col = effect_idx
+                    flat_idx = row * k + col
+                    if 0 <= flat_idx < params.size:
                         param_indices.append(flat_idx)
 
-                    if len(param_indices) > 0:
-                        r_matrix = np.zeros((len(param_indices), fitted.params.size))
-                        for idx, pi in enumerate(param_indices):
-                            if pi < fitted.params.size:
-                                r_matrix[idx, pi] = 1.0
-
-                        wald_test = fitted.wald_test(r_matrix)
-                        wald_stat = float(wald_test.statistic)
-                        wald_pval = float(wald_test.pvalue)
-                    else:
-                        wald_stat = np.nan
-                        wald_pval = np.nan
-                except Exception:
+                if len(param_indices) == 0:
                     wald_stat = np.nan
                     wald_pval = np.nan
-            else:
+                else:
+                    m = len(param_indices)
+                    beta = params.flatten()[param_indices]
+                    r = np.zeros((m, params.size))
+                    for idx, pi in enumerate(param_indices):
+                        r[idx, pi] = 1.0
+
+                    r_cov = r @ cov_params @ r.T
+                    try:
+                        r_cov_inv = np.linalg.inv(r_cov)
+                    except np.linalg.LinAlgError:
+                        r_cov_inv = np.linalg.pinv(r_cov)
+
+                    wald_stat = float(beta @ r_cov_inv @ beta)
+                    df_num = m
+                    df_denom = n_obs - (1 + p * k)
+                    f_stat = wald_stat / df_num
+                    wald_pval = float(1 - stats.f.cdf(f_stat, df_num, df_denom))
+
+            except Exception:
                 wald_stat = np.nan
                 wald_pval = np.nan
 
@@ -177,20 +188,48 @@ def conditional_granger_test(df, cause_col, effect_col, control_cols, max_lag, c
         return None, f"VAR model fitting failed: {str(e)}"
 
     n_vars = len(all_cols)
+    p = optimal_lag
+    k = n_vars
     effect_idx = 0
     cause_idx = 1
 
     try:
-        r_matrix = np.zeros((optimal_lag, fitted.params.size))
-        for lag_idx in range(optimal_lag):
-            row = effect_idx
-            col = lag_idx * n_vars + cause_idx
-            if col < fitted.params.size:
-                r_matrix[lag_idx, col] = 1.0
+        params = fitted.params.values
+        cov_params = fitted.cov_params()
+        n_obs = len(fitted.resid)
+    except Exception as e:
+        return None, f"Cannot extract model parameters: {str(e)}"
 
-        wald_test = fitted.wald_test(r_matrix)
-        wald_stat = float(wald_test.statistic)
-        wald_pval = float(wald_test.pvalue)
+    try:
+        param_indices = []
+        for lag_idx in range(p):
+            row = 1 + lag_idx * k + cause_idx
+            col = effect_idx
+            flat_idx = row * k + col
+            if 0 <= flat_idx < params.size:
+                param_indices.append(flat_idx)
+
+        if len(param_indices) == 0:
+            wald_stat = np.nan
+            wald_pval = np.nan
+        else:
+            m = len(param_indices)
+            beta = params.flatten()[param_indices]
+            r = np.zeros((m, params.size))
+            for idx, pi in enumerate(param_indices):
+                r[idx, pi] = 1.0
+
+            r_cov = r @ cov_params @ r.T
+            try:
+                r_cov_inv = np.linalg.inv(r_cov)
+            except np.linalg.LinAlgError:
+                r_cov_inv = np.linalg.pinv(r_cov)
+
+            wald_stat = float(beta @ r_cov_inv @ beta)
+            df_num = m
+            df_denom = n_obs - (1 + p * k)
+            f_stat = wald_stat / df_num
+            wald_pval = float(1 - stats.f.cdf(f_stat, df_num, df_denom))
     except Exception:
         wald_stat = np.nan
         wald_pval = np.nan

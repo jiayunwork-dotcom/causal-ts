@@ -6,7 +6,7 @@ from sklearn.covariance import EmpiricalCovariance
 
 
 def partial_correlation(x, y, z_matrix, data):
-    if z_matrix is None or z_matrix.shape[1] == 0:
+    if z_matrix is None or len(z_matrix) == 0:
         r = np.corrcoef(data[x], data[y])[0, 1]
         return r
 
@@ -140,28 +140,26 @@ def _pc_phase(data, selected_cols, tau_max, alpha, ci_test):
                     continue
 
                 for cond in combinations(other_parents, cond_set_size):
+                    data_with_lag = data.copy()
                     z_cols = []
                     for (c, t) in cond:
-                        shifted = data[selected_cols[c]].shift(t)
-                        shifted.name = f"{selected_cols[c]}_lag{t}"
-                        data_with_lag = data.copy()
-                        data_with_lag[shifted.name] = shifted.values
-
-                        z_cols.append(shifted.name)
+                        col_name = f"{selected_cols[c]}_lag{t}"
+                        data_with_lag[col_name] = data[selected_cols[c]].shift(t).values
+                        z_cols.append(col_name)
 
                     x_name = selected_cols[i]
-                    shifted_source = data[selected_cols[j]].shift(tau)
-                    shifted_source.name = f"{selected_cols[j]}_lag{tau}"
-                    data_with_lag = data.copy()
-                    data_with_lag[shifted_source.name] = shifted_source.values
+                    source_name = f"{selected_cols[j]}_lag{tau}"
+                    data_with_lag[source_name] = data[selected_cols[j]].shift(tau).values
+
+                    data_with_lag = data_with_lag.dropna()
 
                     if ci_test == "parcorr":
                         r, p, sig = _parcorr_test(
-                            shifted_source.name, x_name, z_cols, data_with_lag, alpha
+                            source_name, x_name, z_cols, data_with_lag, alpha
                         )
                     else:
                         mi, p, sig = _mutual_info_estimate(
-                            shifted_source.name, x_name, z_cols, data_with_lag
+                            source_name, x_name, z_cols, data_with_lag
                         )
 
                     if not sig:
@@ -180,16 +178,22 @@ def _mci_phase(data, selected_cols, pc_parents, tau_max, alpha, ci_test):
 
     for i in range(n_vars):
         for (j, tau) in pc_parents[i]:
+            data_test = data.copy()
             z_cols_target = []
+
             for (c, t) in pc_parents[i]:
                 if (c, t) != (j, tau):
-                    z_cols_target.append(selected_cols[c])
+                    col_name = f"{selected_cols[c]}_lag{t}"
+                    data_test[col_name] = data[selected_cols[c]].shift(t).values
+                    z_cols_target.append(col_name)
 
-            data_test = data.copy()
-
-            shifted_source = data[selected_cols[j]].shift(tau)
             source_name = f"{selected_cols[j]}_lag{tau}"
-            data_test[source_name] = shifted_source.values
+            data_test[source_name] = data[selected_cols[j]].shift(tau).values
+
+            data_test = data_test.dropna()
+
+            if len(data_test) < 10:
+                continue
 
             if ci_test == "parcorr":
                 r, p, sig = _parcorr_test(
