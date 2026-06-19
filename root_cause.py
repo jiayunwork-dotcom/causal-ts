@@ -3,9 +3,49 @@ import pandas as pd
 from granger_test import bivariate_granger_test
 
 
+def _cluster_anomaly_events(anomaly_indices, gap_threshold=10):
+    """
+    将异常点聚类为异常事件
+
+    Parameters:
+    -----------
+    anomaly_indices : list
+        异常点索引列表（已排序）
+    gap_threshold : int
+        两个异常点之间的间隔超过此值则视为不同事件
+
+    Returns:
+    --------
+    list : 每个元素是 (start_idx, end_idx) 表示一个异常事件的起止索引
+    """
+    if not anomaly_indices:
+        return []
+
+    sorted_indices = sorted(anomaly_indices)
+    events = []
+    current_start = sorted_indices[0]
+    current_end = sorted_indices[0]
+
+    for i in range(1, len(sorted_indices)):
+        if sorted_indices[i] - current_end <= gap_threshold:
+            current_end = sorted_indices[i]
+        else:
+            events.append((current_start, current_end))
+            current_start = sorted_indices[i]
+            current_end = sorted_indices[i]
+
+    events.append((current_start, current_end))
+    return events
+
+
 def split_normal_abnormal_segments(df, target_col, anomaly_indices, window_size=30):
     """
-    将时间序列按异常点切分为正常段和异常段
+    将时间序列按异常事件切分为正常段和异常段
+
+    策略：
+    - 将异常点聚类为异常事件
+    - 正常段：每个异常事件之前的 window_size 个点（异常发生前的正常时期）
+    - 异常段：每个异常事件及之后的 window_size 个点
 
     Parameters:
     -----------
@@ -16,30 +56,49 @@ def split_normal_abnormal_segments(df, target_col, anomaly_indices, window_size=
     anomaly_indices : list
         异常点索引列表
     window_size : int
-        异常点前后窗口大小
+        窗口大小
 
     Returns:
     --------
-    dict : {
-        "normal_df": 正常段数据,
-        "abnormal_df": 异常段数据,
-        "normal_indices": 正常段索引,
-        "abnormal_indices": 异常段索引
-    }
+    dict
     """
     n = len(df)
 
-    anomaly_set = set(anomaly_indices)
+    if not anomaly_indices:
+        return {
+            "normal_df": df.copy(),
+            "abnormal_df": df.iloc[0:0].copy(),
+            "normal_indices": list(range(n)),
+            "abnormal_indices": [],
+            "events": []
+        }
 
-    abnormal_window_indices = set()
-    for ai in anomaly_indices:
-        start = max(0, ai - window_size)
-        end = min(n - 1, ai + window_size)
-        for idx in range(start, end + 1):
-            abnormal_window_indices.add(idx)
+    events = _cluster_anomaly_events(anomaly_indices, gap_threshold=max(5, window_size // 3))
 
-    normal_indices = sorted(set(range(n)) - abnormal_window_indices)
-    abnormal_indices = sorted(abnormal_window_indices)
+    normal_indices_set = set()
+    abnormal_indices_set = set()
+
+    for start_idx, end_idx in events:
+        pre_start = max(0, start_idx - window_size)
+        pre_end = max(0, start_idx - 1)
+        if pre_start <= pre_end:
+            for idx in range(pre_start, pre_end + 1):
+                normal_indices_set.add(idx)
+
+        post_start = start_idx
+        post_end = min(n - 1, end_idx + window_size)
+        if post_start <= post_end:
+            for idx in range(post_start, post_end + 1):
+                abnormal_indices_set.add(idx)
+
+    min_normal_size = max(20, window_size)
+    if len(normal_indices_set) < min_normal_size:
+        all_normal = set(range(n)) - abnormal_indices_set
+        if len(all_normal) > min_normal_size:
+            normal_indices_set = all_normal
+
+    normal_indices = sorted(normal_indices_set)
+    abnormal_indices = sorted(abnormal_indices_set)
 
     normal_df = df.iloc[normal_indices].copy()
     abnormal_df = df.iloc[abnormal_indices].copy()
@@ -48,7 +107,8 @@ def split_normal_abnormal_segments(df, target_col, anomaly_indices, window_size=
         "normal_df": normal_df,
         "abnormal_df": abnormal_df,
         "normal_indices": normal_indices,
-        "abnormal_indices": abnormal_indices
+        "abnormal_indices": abnormal_indices,
+        "events": events
     }
 
 
@@ -56,27 +116,6 @@ def compute_causal_strength_change(df, target_col, candidate_cols, anomaly_indic
                                    window_size=30, max_lag=5, criterion="aic"):
     """
     计算正常段和异常段的Granger因果强度变化
-
-    Parameters:
-    -----------
-    df : pd.DataFrame
-        完整数据
-    target_col : str
-        目标变量（出现异常的变量）
-    candidate_cols : list
-        候选根因变量列表
-    anomaly_indices : list
-        目标变量的异常点索引
-    window_size : int
-        异常段窗口大小
-    max_lag : int
-        Granger检验最大滞后阶数
-    criterion : str
-        信息准则
-
-    Returns:
-    --------
-    list : 每个候选变量的分析结果
     """
     segments = split_normal_abnormal_segments(df, target_col, anomaly_indices, window_size)
     normal_df = segments["normal_df"]
@@ -103,7 +142,9 @@ def compute_causal_strength_change(df, target_col, candidate_cols, anomaly_indic
                     (normal_result["effect"] == target_col)
                 ]
                 if len(target_row) > 0:
-                    normal_f = target_row.iloc[0]["f_statistic"]
+                    val = target_row.iloc[0]["f_statistic"]
+                    if not pd.isna(val):
+                        normal_f = float(val)
         except Exception:
             pass
 
@@ -118,7 +159,9 @@ def compute_causal_strength_change(df, target_col, candidate_cols, anomaly_indic
                     (abnormal_result["effect"] == target_col)
                 ]
                 if len(target_row) > 0:
-                    abnormal_f = target_row.iloc[0]["f_statistic"]
+                    val = target_row.iloc[0]["f_statistic"]
+                    if not pd.isna(val):
+                        abnormal_f = float(val)
         except Exception:
             pass
 
@@ -138,34 +181,19 @@ def compute_causal_strength_change(df, target_col, candidate_cols, anomaly_indic
 def compute_propagation_lag(target_anomaly_indices, candidate_anomaly_indices, max_lag=20):
     """
     计算异常传播时滞：候选根因变量的异常点平均比目标变量的异常点早多少个时间步
-
-    Parameters:
-    -----------
-    target_anomaly_indices : list
-        目标变量的异常点索引
-    candidate_anomaly_indices : list
-        候选根因变量的异常点索引
-    max_lag : int
-        最大考虑时滞
-
-    Returns:
-    --------
-    float : 平均传播时滞（正数表示候选变量先异常）
     """
     if not target_anomaly_indices or not candidate_anomaly_indices:
         return np.nan
 
-    target_set = set(target_anomaly_indices)
     candidate_set = set(candidate_anomaly_indices)
 
     lags = []
     for t_idx in target_anomaly_indices:
         best_lag = None
-        for c_idx in candidate_anomaly_indices:
-            lag = t_idx - c_idx
-            if 0 <= lag <= max_lag:
-                if best_lag is None or lag < best_lag:
-                    best_lag = lag
+        for lag in range(0, max_lag + 1):
+            if (t_idx - lag) in candidate_set:
+                best_lag = lag
+                break
         if best_lag is not None:
             lags.append(best_lag)
 
@@ -180,29 +208,6 @@ def root_cause_analysis(df, target_col, candidate_cols, anomaly_results,
                         max_lag=5, criterion="aic"):
     """
     完整的根因分析
-
-    Parameters:
-    -----------
-    df : pd.DataFrame
-        完整数据
-    target_col : str
-        目标变量
-    candidate_cols : list
-        候选根因变量
-    anomaly_results : dict
-        异常检测结果（来自 run_all_anomaly_detectors）
-    anomaly_method : str
-        使用的异常检测方法
-    window_size : int
-        异常段窗口大小
-    max_lag : int
-        Granger检验最大滞后
-    criterion : str
-        信息准则
-
-    Returns:
-    --------
-    DataFrame : 根因排名表
     """
     from anomaly_detection import get_anomaly_indices
 
@@ -234,28 +239,38 @@ def root_cause_analysis(df, target_col, candidate_cols, anomaly_results,
     ranked_df = pd.DataFrame(ranked_results)
 
     if len(ranked_df) > 0:
-        valid_change = ranked_df[ranked_df["change_rate"].notna()]["change_rate"]
-        if len(valid_change) > 0:
+        has_valid_change = ranked_df["change_rate"].notna().any()
+
+        if has_valid_change:
+            valid_change = ranked_df[ranked_df["change_rate"].notna()]["change_rate"]
             cr_min, cr_max = valid_change.min(), valid_change.max()
             if cr_max != cr_min:
                 ranked_df["norm_change_rate"] = (ranked_df["change_rate"] - cr_min) / (cr_max - cr_min)
+                ranked_df["norm_change_rate"] = ranked_df["norm_change_rate"].fillna(0)
             else:
                 ranked_df["norm_change_rate"] = 0.5
         else:
-            ranked_df["norm_change_rate"] = 0.5
+            valid_abnormal_f = ranked_df[ranked_df["abnormal_f_value"].notna()]["abnormal_f_value"]
+            if len(valid_abnormal_f) > 0:
+                af_min, af_max = valid_abnormal_f.min(), valid_abnormal_f.max()
+                if af_max != af_min:
+                    ranked_df["norm_change_rate"] = (ranked_df["abnormal_f_value"] - af_min) / (af_max - af_min)
+                    ranked_df["norm_change_rate"] = ranked_df["norm_change_rate"].fillna(0)
+                else:
+                    ranked_df["norm_change_rate"] = 0.5
+            else:
+                ranked_df["norm_change_rate"] = 0.5
 
         valid_lag = ranked_df[ranked_df["propagation_lag"].notna()]["propagation_lag"]
         if len(valid_lag) > 0:
             lag_min, lag_max = valid_lag.min(), valid_lag.max()
             if lag_max != lag_min:
                 ranked_df["norm_lag_score"] = 1.0 - (ranked_df["propagation_lag"] - lag_min) / (lag_max - lag_min)
+                ranked_df["norm_lag_score"] = ranked_df["norm_lag_score"].fillna(0)
             else:
                 ranked_df["norm_lag_score"] = 0.5
         else:
             ranked_df["norm_lag_score"] = 0.5
-
-        ranked_df["norm_change_rate"] = ranked_df["norm_change_rate"].fillna(0)
-        ranked_df["norm_lag_score"] = ranked_df["norm_lag_score"].fillna(0)
 
         ranked_df["composite_score"] = (
             ranked_df["norm_change_rate"] * 0.6 +
