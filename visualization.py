@@ -584,3 +584,178 @@ def plot_cross_correlation_compare(normal_df, abnormal_df, x_col, y_col, max_lag
 
     fig.tight_layout()
     return fig
+
+
+def plot_propagation_graph(propagation_edges, selected_cols, root_cause, target_var,
+                            strongest_path=None, title="Anomaly Propagation Graph"):
+    """
+    绘制异常传播子图的有向图
+    
+    节点颜色区分：根因=红色，目标=橙色，路径中间节点=蓝色，其他=灰色
+    边粗细=因果强度，边上标注传播时滞
+    最强路径用粗虚线高亮
+    
+    Parameters:
+    -----------
+    propagation_edges : list
+        异常传播子图的边列表
+    selected_cols : list
+        所有选中的变量
+    root_cause : str
+        根因变量
+    target_var : str
+        目标变量
+    strongest_path : dict or None
+        最强路径（find_all_paths_bfs 返回的格式）
+    title : str
+        图标题
+    
+    Returns:
+    --------
+    matplotlib.figure.Figure
+    """
+    import networkx as nx
+    
+    G = nx.DiGraph()
+    
+    for col in selected_cols:
+        G.add_node(col)
+    
+    for edge in propagation_edges:
+        G.add_edge(
+            edge["source"], edge["target"],
+            weight=edge["strength"],
+            lag=edge.get("lag", 1),
+            anomaly_lag=edge.get("anomaly_lag", edge.get("lag", 1)),
+            p_value=edge.get("p_value", np.nan)
+        )
+    
+    path_nodes = set()
+    path_edges_set = set()
+    if strongest_path is not None:
+        path_nodes = set(strongest_path["nodes"])
+        for e in strongest_path["edges"]:
+            path_edges_set.add((e["source"], e["target"]))
+    
+    def get_node_color(node):
+        if node == root_cause:
+            return "#ef4444"
+        elif node == target_var:
+            return "#f97316"
+        elif node in path_nodes:
+            return "#3b82f6"
+        else:
+            return "#9ca3af"
+    
+    node_colors = [get_node_color(n) for n in G.nodes()]
+    
+    if len(G.edges) == 0:
+        fig, ax = plt.subplots(figsize=(10, 7))
+        ax.text(0.5, 0.5, "No propagation edges found\nTry adjusting PCMCI parameters or anomaly detection sensitivity",
+                ha="center", va="center", fontsize=14, color="gray", linespacing=1.5)
+        ax.set_title(title, fontsize=13, fontweight="bold")
+        return fig
+    
+    pos = nx.spring_layout(G, k=3.0, iterations=150, seed=42)
+    
+    degrees = dict(G.degree())
+    node_sizes = [400 + degrees.get(n, 0) * 250 for n in G.nodes()]
+    
+    edge_weights = [G[u][v]["weight"] for u, v in G.edges()]
+    max_w = max(edge_weights) if edge_weights else 1
+    min_w = min(edge_weights) if edge_weights else 0
+    
+    fig, ax = plt.subplots(figsize=(13, 9))
+    
+    for u, v in G.edges():
+        is_path_edge = (u, v) in path_edges_set
+        w = G[u][v]["weight"]
+        if is_path_edge:
+            width = 3.5 + 3 * (w - min_w) / (max_w - min_w + 1e-10)
+        else:
+            width = 1 + 2.5 * (w - min_w) / (max_w - min_w + 1e-10)
+        
+        edge_color = "#1e40af" if is_path_edge else "#64748b"
+        style = "--" if is_path_edge else "solid"
+        alpha = 0.95 if is_path_edge else 0.6
+        
+        nx.draw_networkx_edges(
+            G, pos,
+            edgelist=[(u, v)],
+            width=width,
+            edge_color=edge_color,
+            alpha=alpha,
+            arrows=True,
+            arrowsize=25 if is_path_edge else 18,
+            arrowstyle="->",
+            connectionstyle="arc3,rad=0.1",
+            style=style,
+            min_source_margin=25,
+            min_target_margin=25,
+            ax=ax
+        )
+    
+    nx.draw_networkx_nodes(
+        G, pos,
+        node_size=node_sizes,
+        node_color=node_colors,
+        alpha=0.9,
+        ax=ax,
+        edgecolors="white",
+        linewidths=2.5
+    )
+    
+    nx.draw_networkx_labels(
+        G, pos,
+        font_size=10,
+        font_weight="bold",
+        font_color="white",
+        ax=ax
+    )
+    
+    edge_labels = {}
+    for u, v in G.edges():
+        anomaly_lag = G[u][v].get("anomaly_lag", G[u][v].get("lag", "?"))
+        weight = G[u][v].get("weight", 0)
+        is_path_edge = (u, v) in path_edges_set
+        marker = " ★" if is_path_edge else ""
+        edge_labels[(u, v)] = f"τ={anomaly_lag}{marker}\n{weight:.3f}"
+    
+    nx.draw_networkx_edge_labels(
+        G, pos,
+        edge_labels=edge_labels,
+        font_size=8,
+        font_color="#1e293b",
+        bbox=dict(boxstyle="round,pad=0.25",
+                  facecolor="white", alpha=0.85, edgecolor="none"),
+        ax=ax
+    )
+    
+    legend_elements = [
+        mpatches.Patch(color="#ef4444", label=f"Root Cause: {root_cause}"),
+        mpatches.Patch(color="#f97316", label=f"Target: {target_var}"),
+        mpatches.Patch(color="#3b82f6", label="Intermediate Node (on path)"),
+        mpatches.Patch(color="#9ca3af", label="Other Node"),
+    ]
+    
+    if strongest_path is not None:
+        from matplotlib.lines import Line2D
+        legend_elements.append(
+            Line2D([0], [0], color="#1e40af", linewidth=3, linestyle="--", label="Strongest Path")
+        )
+    
+    ax.legend(
+        handles=legend_elements,
+        loc="upper left",
+        bbox_to_anchor=(1.02, 1),
+        fontsize=9,
+        title="Node / Edge Legend",
+        title_fontsize=10,
+        framealpha=0.95
+    )
+    
+    ax.set_title(title, fontsize=13, fontweight="bold", pad=15)
+    ax.axis("off")
+    fig.tight_layout()
+    return fig
+

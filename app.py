@@ -35,9 +35,11 @@ from anomaly_detection import (
     run_all_anomaly_detectors, get_consensus_anomalies, get_anomaly_indices
 )
 from root_cause import root_cause_analysis
+from propagation_path import run_propagation_path_analysis
 from visualization import (
     plot_all_anomaly_scatters, plot_root_cause_bar,
-    plot_anomaly_timeline, plot_scatter_compare, plot_cross_correlation_compare
+    plot_anomaly_timeline, plot_scatter_compare, plot_cross_correlation_compare,
+    plot_propagation_graph
 )
 
 warnings.filterwarnings("ignore")
@@ -71,6 +73,9 @@ class AnalysisState:
         self.root_cause_df = None
         self.root_cause_segments = None
         self.root_cause_target = None
+        self.propagation_result = None
+        self.propagation_root_cause = None
+        self.propagation_target = None
 
     def reset(self):
         self.__init__()
@@ -639,6 +644,181 @@ def on_select_candidate_verification(candidate_var):
     except Exception as e:
         print(f"Verification plot error: {e}")
         return None, None
+
+
+def on_infer_propagation_path(pp_tau_max, pp_alpha, pp_ci_test):
+    if state.root_cause_df is None or len(state.root_cause_df) == 0:
+        return "Please run Root Cause Analysis first", None, None, pd.DataFrame(
+            columns=["Rank", "Path", "Total Lag", "Avg Causal Strength"]
+        )
+
+    if state.anomaly_results is None or state.processed_df is None:
+        return "Please run anomaly detection and preprocessing first", None, None, pd.DataFrame(
+            columns=["Rank", "Path", "Total Lag", "Avg Causal Strength"]
+        )
+
+    target_var = state.root_cause_target
+    if not target_var:
+        return "No target variable set", None, None, pd.DataFrame(
+            columns=["Rank", "Path", "Total Lag", "Avg Causal Strength"]
+        )
+
+    root_cause_var = state.root_cause_df.iloc[0]["candidate_variable"]
+
+    try:
+        pcmci_params = {
+            "tau_max": int(pp_tau_max),
+            "alpha": float(pp_alpha),
+            "ci_test": pp_ci_test
+        }
+
+        result = run_propagation_path_analysis(
+            state.processed_df,
+            state.selected_cols,
+            root_cause_var,
+            target_var,
+            state.anomaly_results,
+            pcmci_params,
+            anomaly_method=state.anomaly_method,
+            top_k=3
+        )
+
+        state.propagation_result = result
+        state.propagation_root_cause = root_cause_var
+        state.propagation_target = target_var
+
+        propagation_edges = result["propagation_edges"]
+        strongest_path = result["strongest_path"]
+        all_paths = result["all_paths"]
+        top_paths = result["top_paths"]
+
+        graph_fig = plot_propagation_graph(
+            propagation_edges,
+            state.selected_cols,
+            root_cause_var,
+            target_var,
+            strongest_path=strongest_path,
+            title=f"Anomaly Propagation Graph: {root_cause_var} → {target_var}"
+        )
+
+        info = f"Propagation Path Analysis Complete\n"
+        info += f"Root Cause: {root_cause_var}\n"
+        info += f"Target Variable: {target_var}\n"
+        info += f"PCMCI causal edges: {len(result['pcmci_edges'])}\n"
+        info += f"Propagation edges: {len(propagation_edges)}\n"
+        info += f"Paths found: {len(all_paths)}\n\n"
+
+        if strongest_path is not None:
+            nodes = strongest_path["nodes"]
+            path_str_parts = []
+            for i, node in enumerate(nodes):
+                if i == 0:
+                    path_str_parts.append(node)
+                else:
+                    edge_info = strongest_path["edges"][i - 1]
+                    path_str_parts.append(f"{node} (τ={edge_info['anomaly_lag']})")
+            path_str = " → ".join(path_str_parts)
+
+            info += "=== Inferred Propagation Path (Strongest) ===\n"
+            info += f"{path_str}\n"
+            info += f"Total Lag: {strongest_path['total_lag']}\n"
+            info += f"Avg Causal Strength: {strongest_path['avg_strength']}\n\n"
+
+            if len(top_paths) > 1:
+                info += f"=== Other Strong Paths (Top {len(top_paths)}) ===\n"
+                for pi, p in enumerate(top_paths[1:], start=2):
+                    n = p["nodes"]
+                    ps_parts = []
+                    for i, node in enumerate(n):
+                        if i == 0:
+                            ps_parts.append(node)
+                        else:
+                            ei = p["edges"][i - 1]
+                            ps_parts.append(f"{node} (τ={ei['anomaly_lag']})")
+                    ps = " → ".join(ps_parts)
+                    info += f"Path #{pi}: {ps} | Avg Strength={p['avg_strength']}, Total Lag={p['total_lag']}\n"
+                info += "\n"
+
+            summary = _generate_path_summary(strongest_path)
+            info += f"Summary Text:\n{summary}"
+        else:
+            msg = "未发现从根因到目标的连通路径,建议检查因果图参数或异常检测灵敏度"
+            info += f"No connected path found from root cause to target.\n{msg}"
+
+        summary_text_raw = _generate_path_summary(strongest_path)
+        if strongest_path is not None:
+            summary_md = f"""
+            <div style="background-color: #f0f9ff; border-left: 4px solid #3b82f6; padding: 15px; border-radius: 6px; margin: 10px 0;">
+                <p style="font-size: 15px; font-weight: 600; margin: 0; color: #1e40af;">📊 {summary_text_raw}</p>
+            </div>
+            """
+        else:
+            summary_md = f"""
+            <div style="background-color: #fef2f2; border-left: 4px solid #ef4444; padding: 15px; border-radius: 6px; margin: 10px 0;">
+                <p style="font-size: 15px; font-weight: 600; margin: 0; color: #991b1b;">⚠️ {summary_text_raw}</p>
+            </div>
+            """
+
+        paths_df_data = []
+        for pi, p in enumerate(top_paths, start=1):
+            n = p["nodes"]
+            ps_parts = []
+            for i, node in enumerate(n):
+                if i == 0:
+                    ps_parts.append(node)
+                else:
+                    ei = p["edges"][i - 1]
+                    ps_parts.append(f"{node}(τ={ei['anomaly_lag']})")
+            ps_str = " → ".join(ps_parts)
+            paths_df_data.append({
+                "Rank": pi,
+                "Path": ps_str,
+                "Total Lag": p["total_lag"],
+                "Avg Causal Strength": p["avg_strength"]
+            })
+
+        paths_df = pd.DataFrame(paths_df_data) if paths_df_data else pd.DataFrame(
+            columns=["Rank", "Path", "Total Lag", "Avg Causal Strength"]
+        )
+
+        return info, graph_fig, gr.Markdown(summary_md), paths_df
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        err_md = f"""
+        <div style="background-color: #fef2f2; border-left: 4px solid #ef4444; padding: 15px; border-radius: 6px; margin: 10px 0;">
+            <p style="font-size: 15px; font-weight: 600; margin: 0; color: #991b1b;">⚠️ Error: {str(e)}</p>
+        </div>
+        """
+        return (f"Error in propagation path inference: {str(e)}", None,
+                gr.Markdown(err_md),
+                pd.DataFrame(columns=["Rank", "Path", "Total Lag", "Avg Causal Strength"]))
+
+
+def _generate_path_summary(strongest_path):
+    if strongest_path is None:
+        return "未发现从根因到目标的连通路径,建议检查因果图参数或异常检测灵敏度"
+
+    nodes = strongest_path["nodes"]
+    edges = strongest_path["edges"]
+    total_lag = strongest_path["total_lag"]
+    avg_strength = strongest_path["avg_strength"]
+
+    if len(nodes) < 2:
+        return "未发现从根因到目标的连通路径,建议检查因果图参数或异常检测灵敏度"
+
+    parts = []
+    for i, node in enumerate(nodes):
+        if i == 0:
+            parts.append(node)
+        else:
+            lag_val = edges[i - 1]["anomaly_lag"]
+            parts.append(f"{node} (时滞={lag_val})")
+
+    path_str = " → ".join(parts)
+    summary = f"推断传播路径: {path_str},路径总时滞={total_lag},平均因果强度={avg_strength}"
+    return summary
 
 
 def _method_display_name(method_key):
@@ -1490,6 +1670,45 @@ def build_app():
                         with gr.Row():
                             verify_ccf = gr.Plot(label="Cross-correlation Comparison")
 
+                    with gr.Tab("Step 4: Propagation Path"):
+                        with gr.Row():
+                            with gr.Column(scale=1):
+                                gr.Markdown("### PCMCI Causal Discovery Parameters")
+                                pp_tau_max = gr.Slider(1, 20, value=5, step=1, label="Max Time Lag (tau_max)")
+                                pp_alpha = gr.Slider(0.01, 0.2, value=0.05, step=0.01, label="Significance Level (alpha)")
+                                pp_ci_test = gr.Dropdown(
+                                    label="Conditional Independence Test",
+                                    choices=[("Partial Correlation (Linear)", "parcorr"),
+                                             ("Mutual Information (Nonlinear)", "mi")],
+                                    value="parcorr"
+                                )
+                                gr.Markdown("---")
+                                pp_btn = gr.Button("Infer Path", variant="primary", size="lg")
+                                gr.Markdown(
+                                    """
+                                    💡 **How it works:**
+                                    1. Runs PCMCI to discover the causal graph
+                                    2. Filters edges where anomaly time-order matches (source anomalies precede target)
+                                    3. BFS from root cause → target, sorted by avg causal strength
+                                    4. Highlights the strongest path with thick dashed lines
+                                    """
+                                )
+                            with gr.Column(scale=2):
+                                pp_info = gr.Textbox(label="Path Analysis Results", lines=16, interactive=False)
+                        with gr.Row():
+                            pp_graph = gr.Plot(label="Anomaly Propagation Graph")
+                        with gr.Row():
+                            pp_summary = gr.Markdown(
+                                value="<p style='color: #888; font-style: italic;'>Run 'Infer Path' to see the propagation path summary</p>"
+                            )
+                        with gr.Row():
+                            pp_paths_list = gr.Dataframe(
+                                label="All Discovered Paths (Top 3 by Avg Causal Strength)",
+                                interactive=False,
+                                headers=["Rank", "Path", "Total Lag", "Avg Causal Strength"],
+                                datatype=["number", "str", "number", "number"]
+                            )
+
                 anomaly_btn.click(
                     fn=on_run_anomaly_detection,
                     inputs=[zscore_window, zscore_threshold, cusum_k, cusum_h, if_contamination],
@@ -1514,6 +1733,11 @@ def build_app():
                     fn=on_select_candidate_verification,
                     inputs=[rc_candidate_select],
                     outputs=[verify_scatter, verify_ccf]
+                )
+                pp_btn.click(
+                    fn=on_infer_propagation_path,
+                    inputs=[pp_tau_max, pp_alpha, pp_ci_test],
+                    outputs=[pp_info, pp_graph, pp_summary, pp_paths_list]
                 )
 
             with gr.Tab("Snapshot Compare"):
