@@ -287,3 +287,300 @@ def plot_var_roots(fitted_var, selected_cols, title="VAR Model Stability (Eigenv
     ax.legend(fontsize=9)
     fig.tight_layout()
     return fig
+
+
+def plot_anomaly_scatter(series, is_anomaly, var_name, title="Anomaly Detection"):
+    """
+    绘制单变量异常点散点图
+    """
+    fig, ax = plt.subplots(figsize=(12, 4))
+
+    n = len(series)
+    indices = np.arange(n)
+
+    normal_mask = ~is_anomaly
+    anomaly_mask = is_anomaly
+
+    ax.scatter(indices[normal_mask], series.values[normal_mask],
+               c="#94a3b8", alpha=0.5, s=10, label="Normal")
+    ax.scatter(indices[anomaly_mask], series.values[anomaly_mask],
+               c="#ef4444", alpha=0.9, s=25, label="Anomaly", zorder=5)
+
+    ax.set_xlabel("Time Index", fontsize=10)
+    ax.set_ylabel("Value", fontsize=10)
+    ax.set_title(f"{title}: {var_name}", fontsize=12, fontweight="bold")
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    return fig
+
+
+def plot_all_anomaly_scatters(anomaly_results, selected_cols, method="consensus"):
+    """
+    绘制所有变量的异常散点图（子图）
+    """
+    from anomaly_detection import get_consensus_anomalies
+
+    n_vars = len(selected_cols)
+    nrows = min(n_vars, 4)
+    ncols = (n_vars + nrows - 1) // nrows
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(16, 4 * nrows))
+    if n_vars == 1:
+        axes = np.array([axes])
+    axes = axes.flatten()
+
+    for i, col in enumerate(selected_cols):
+        if i >= len(axes):
+            break
+        var_res = anomaly_results["per_variable"][col]
+        series = var_res["series"]
+        is_anomaly = get_consensus_anomalies(anomaly_results, col, method)
+
+        ax = axes[i]
+        indices = np.arange(len(series))
+
+        normal_mask = ~is_anomaly
+        anomaly_mask = is_anomaly
+
+        ax.scatter(indices[normal_mask], series.values[normal_mask],
+                   c="#94a3b8", alpha=0.5, s=10, label="Normal")
+        ax.scatter(indices[anomaly_mask], series.values[anomaly_mask],
+                   c="#ef4444", alpha=0.9, s=25, label="Anomaly", zorder=5)
+
+        ax.set_xlabel("Time Index", fontsize=9)
+        ax.set_ylabel("Value", fontsize=9)
+        ax.set_title(col, fontsize=10, fontweight="bold")
+        ax.grid(True, alpha=0.3)
+        if i == 0:
+            ax.legend(fontsize=8)
+
+    for j in range(n_vars, len(axes)):
+        axes[j].axis("off")
+
+    fig.suptitle(f"Anomaly Detection Results ({method.upper()})", fontsize=13, fontweight="bold", y=1.01)
+    fig.tight_layout()
+    return fig
+
+
+def plot_root_cause_bar(root_cause_df, title="Root Cause Composite Score"):
+    """
+    绘制根因得分水平柱状图
+    """
+    if root_cause_df is None or len(root_cause_df) == 0:
+        fig, ax = plt.subplots(figsize=(8, 5))
+        ax.text(0.5, 0.5, "No root cause data available",
+                ha="center", va="center", fontsize=14, color="gray")
+        ax.set_title(title, fontsize=12, fontweight="bold")
+        return fig
+
+    df = root_cause_df.copy()
+    df = df.sort_values("composite_score", ascending=True)
+
+    fig, ax = plt.subplots(figsize=(10, max(4, len(df) * 0.6)))
+
+    cmap = plt.cm.RdBu_r
+    norm = Normalize(vmin=df["composite_score"].min(), vmax=df["composite_score"].max())
+    colors = [cmap(norm(score)) for score in df["composite_score"]]
+
+    y_pos = range(len(df))
+    bars = ax.barh(y_pos, df["composite_score"], color=colors, edgecolor="#333", linewidth=0.5)
+
+    for i, (bar, score) in enumerate(zip(bars, df["composite_score"])):
+        ax.text(bar.get_width() + 0.01, bar.get_y() + bar.get_height() / 2,
+                f"{score:.4f}", va="center", fontsize=9)
+
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(df["candidate_variable"], fontsize=10)
+    ax.set_xlabel("Composite Score", fontsize=10)
+    ax.set_title(title, fontsize=12, fontweight="bold")
+    ax.set_xlim(0, 1.15)
+    ax.grid(True, alpha=0.3, axis="x")
+
+    fig.tight_layout()
+    return fig
+
+
+def plot_anomaly_timeline(anomaly_results, selected_cols, target_col, root_cause_df,
+                          method="consensus", title="Anomaly Propagation Timeline"):
+    """
+    绘制异常传播时间线图
+    """
+    from anomaly_detection import get_consensus_anomalies
+
+    if root_cause_df is not None and len(root_cause_df) > 0:
+        sorted_vars = root_cause_df["candidate_variable"].tolist()
+        if target_col not in sorted_vars:
+            sorted_vars = sorted_vars + [target_col]
+        else:
+            sorted_vars = [v for v in sorted_vars if v != target_col] + [target_col]
+    else:
+        sorted_vars = [v for v in selected_cols if v != target_col] + [target_col]
+
+    n_vars = len(sorted_vars)
+    if n_vars == 0:
+        fig, ax = plt.subplots(figsize=(10, 4))
+        ax.text(0.5, 0.5, "No data available", ha="center", va="center", fontsize=14, color="gray")
+        ax.set_title(title, fontsize=12, fontweight="bold")
+        return fig
+
+    n_time = len(anomaly_results["per_variable"][sorted_vars[0]]["series"])
+
+    fig, ax = plt.subplots(figsize=(14, max(4, n_vars * 0.8)))
+
+    y_pos = range(n_vars)
+
+    for i, var in enumerate(sorted_vars):
+        if var not in anomaly_results["per_variable"]:
+            continue
+        is_anomaly = get_consensus_anomalies(anomaly_results, var, method)
+        anomaly_indices = np.where(is_anomaly)[0]
+
+        ax.scatter(anomaly_indices, np.full_like(anomaly_indices, i, dtype=float),
+                   c="#ef4444", s=40, zorder=5, edgecolors="white", linewidths=0.5)
+
+    if root_cause_df is not None and len(root_cause_df) > 0:
+        target_anomalies = get_consensus_anomalies(anomaly_results, target_col, method)
+        target_anom_indices = np.where(target_anomalies)[0]
+
+        target_y = n_vars - 1
+
+        for i, var in enumerate(sorted_vars):
+            if var == target_col:
+                continue
+            var_anomalies = get_consensus_anomalies(anomaly_results, var, method)
+            var_anom_indices = np.where(var_anomalies)[0]
+
+            if len(var_anom_indices) == 0 or len(target_anom_indices) == 0:
+                continue
+
+            for t_idx in target_anom_indices[:5]:
+                best_c_idx = None
+                best_lag = None
+                for c_idx in var_anom_indices:
+                    lag = t_idx - c_idx
+                    if 0 <= lag <= 50:
+                        if best_lag is None or lag < best_lag:
+                            best_lag = lag
+                            best_c_idx = c_idx
+                if best_c_idx is not None:
+                    ax.plot([best_c_idx, t_idx], [i, target_y],
+                            color="#f97316", alpha=0.3, linewidth=1, linestyle="--", zorder=1)
+
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(sorted_vars, fontsize=10)
+    ax.set_xlabel("Time Index", fontsize=10)
+    ax.set_title(title, fontsize=12, fontweight="bold")
+    ax.grid(True, alpha=0.3, axis="x")
+
+    if target_col in sorted_vars:
+        target_idx = sorted_vars.index(target_col)
+        ax.axhline(y=target_idx, color="#3b82f6", linestyle="--", alpha=0.7, linewidth=1, label="Target Variable")
+        ax.legend(fontsize=9, loc="upper right")
+
+    fig.tight_layout()
+    return fig
+
+
+def plot_scatter_compare(normal_df, abnormal_df, x_col, y_col, title_prefix=""):
+    """
+    正常段 vs 异常段散点图对比
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    for ax, df, label in [(axes[0], normal_df, "Normal Period"),
+                           (axes[1], abnormal_df, "Abnormal Period")]:
+        if df is None or len(df) < 2:
+            ax.text(0.5, 0.5, "Insufficient data", ha="center", va="center",
+                    fontsize=12, color="gray", transform=ax.transAxes)
+            ax.set_title(f"{label}", fontsize=11, fontweight="bold")
+            continue
+
+        x = df[x_col].values
+        y = df[y_col].values
+
+        valid = ~np.isnan(x) & ~np.isnan(y)
+        x = x[valid]
+        y = y[valid]
+
+        color = "#22c55e" if "Normal" in label else "#ef4444"
+
+        ax.scatter(x, y, alpha=0.5, s=15, color=color)
+
+        if len(x) > 2:
+            z = np.polyfit(x, y, 1)
+            p = np.poly1d(z)
+            x_sorted = np.sort(x)
+            ax.plot(x_sorted, p(x_sorted), "r--", linewidth=1.5, alpha=0.8)
+            r = np.corrcoef(x, y)[0, 1]
+            ax.text(0.05, 0.95, f"r = {r:.3f}", transform=ax.transAxes,
+                    fontsize=10, va="top",
+                    bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
+
+        ax.set_xlabel(x_col, fontsize=10)
+        ax.set_ylabel(y_col, fontsize=10)
+        ax.set_title(f"{label}", fontsize=11, fontweight="bold")
+        ax.grid(True, alpha=0.3)
+
+    fig.suptitle(f"{title_prefix} Scatter Comparison: {x_col} → {y_col}",
+                 fontsize=12, fontweight="bold")
+    fig.tight_layout()
+    return fig
+
+
+def plot_cross_correlation_compare(normal_df, abnormal_df, x_col, y_col, max_lag=20,
+                                    title_prefix=""):
+    """
+    正常段 vs 异常段互相关函数对比
+    """
+    fig, ax = plt.subplots(figsize=(12, 5))
+
+    colors = {"Normal": "#22c55e", "Abnormal": "#ef4444"}
+
+    for df, label in [(normal_df, "Normal"), (abnormal_df, "Abnormal")]:
+        if df is None or len(df) < max_lag + 5:
+            continue
+
+        x = df[x_col].values
+        y = df[y_col].values
+
+        valid = ~np.isnan(x) & ~np.isnan(y)
+        x = x[valid]
+        y = y[valid]
+
+        if len(x) < max_lag + 2:
+            continue
+
+        lags = range(-max_lag, max_lag + 1)
+        corrs = []
+        for lag in lags:
+            if lag >= 0:
+                x_shifted = x[:len(x) - lag] if lag > 0 else x
+                y_shifted = y[lag:]
+            else:
+                x_shifted = x[-lag:]
+                y_shifted = y[:len(y) + lag]
+
+            min_len = min(len(x_shifted), len(y_shifted))
+            if min_len > 5:
+                r = np.corrcoef(x_shifted[:min_len], y_shifted[:min_len])[0, 1]
+                corrs.append(r if not np.isnan(r) else 0)
+            else:
+                corrs.append(0)
+
+        ax.plot(list(lags), corrs, "o-", color=colors[label],
+                linewidth=1.5, markersize=4, label=f"{label} Period")
+
+    ax.axhline(y=0, color="gray", linestyle="--", linewidth=0.8)
+    ax.axvline(x=0, color="gray", linestyle=":", linewidth=0.8)
+    ax.set_xlabel(f"Lag (positive = {x_col} leads)", fontsize=10)
+    ax.set_ylabel("Cross-correlation", fontsize=10)
+    ax.set_title(f"{title_prefix} Cross-correlation Comparison: {x_col} → {y_col}",
+                 fontsize=12, fontweight="bold")
+    ax.legend(fontsize=10)
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim(-1, 1)
+
+    fig.tight_layout()
+    return fig

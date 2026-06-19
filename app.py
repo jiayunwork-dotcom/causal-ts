@@ -31,6 +31,14 @@ from diagnostics import (
 )
 from multiscale import multiscale_analysis, plot_multiscale_comparison, DEFAULT_SCALES
 from report import generate_pdf_report
+from anomaly_detection import (
+    run_all_anomaly_detectors, get_consensus_anomalies, get_anomaly_indices
+)
+from root_cause import root_cause_analysis
+from visualization import (
+    plot_all_anomaly_scatters, plot_root_cause_bar,
+    plot_anomaly_timeline, plot_scatter_compare, plot_cross_correlation_compare
+)
 
 warnings.filterwarnings("ignore")
 
@@ -58,6 +66,11 @@ class AnalysisState:
         self.ms_results = None
         self.snapshots = []
         self.last_preprocess_params = None
+        self.anomaly_results = None
+        self.anomaly_method = "consensus"
+        self.root_cause_df = None
+        self.root_cause_segments = None
+        self.root_cause_target = None
 
     def reset(self):
         self.__init__()
@@ -508,6 +521,124 @@ def on_generate_report():
         return report_path
     except Exception as e:
         return f"Error generating report: {str(e)}"
+
+
+def on_run_anomaly_detection(zscore_window, zscore_threshold, cusum_k, cusum_h, if_contamination):
+    if state.processed_df is None or not state.selected_cols:
+        return "Please run preprocessing and select columns first", None, None, gr.update(choices=[]), gr.update(choices=[])
+
+    try:
+        anomaly_results = run_all_anomaly_detectors(
+            state.processed_df, state.selected_cols,
+            zscore_window=int(zscore_window),
+            zscore_threshold=float(zscore_threshold),
+            cusum_k=float(cusum_k),
+            cusum_h=float(cusum_h),
+            if_contamination=float(if_contamination)
+        )
+        state.anomaly_results = anomaly_results
+        state.anomaly_method = "consensus"
+
+        info = "Anomaly Detection Results Summary\n\n"
+        info += anomaly_results["summary"].to_string(index=False)
+
+        scatter_fig = plot_all_anomaly_scatters(anomaly_results, state.selected_cols, "consensus")
+
+        var_choices = list(state.selected_cols)
+        default_target = var_choices[0] if var_choices else None
+
+        return info, scatter_fig, anomaly_results["summary"], \
+               gr.update(choices=var_choices, value=default_target), \
+               gr.update(choices=var_choices, value=default_target)
+    except Exception as e:
+        return f"Error in anomaly detection: {str(e)}", None, None, gr.update(choices=[]), gr.update(choices=[])
+
+
+def on_change_anomaly_method(method):
+    if state.anomaly_results is None:
+        return None
+
+    state.anomaly_method = method
+    scatter_fig = plot_all_anomaly_scatters(state.anomaly_results, state.selected_cols, method)
+    return scatter_fig
+
+
+def on_run_root_cause(target_var, window_size, max_lag, criterion):
+    if state.anomaly_results is None:
+        return "Please run anomaly detection first", None, None, None, None
+
+    if not target_var or target_var not in state.selected_cols:
+        return "Please select a target variable", None, None, None, None
+
+    try:
+        candidate_cols = [c for c in state.selected_cols if c != target_var]
+
+        if len(candidate_cols) == 0:
+            return "Need at least 2 variables for root cause analysis", None, None, None, None
+
+        root_cause_df, segments = root_cause_analysis(
+            state.processed_df, target_var, candidate_cols,
+            state.anomaly_results,
+            anomaly_method=state.anomaly_method,
+            window_size=int(window_size),
+            max_lag=int(max_lag),
+            criterion=criterion
+        )
+
+        state.root_cause_df = root_cause_df
+        state.root_cause_segments = segments
+        state.root_cause_target = target_var
+
+        if root_cause_df is None or len(root_cause_df) == 0:
+            return "No anomalies detected for root cause analysis", None, None, None, None
+
+        info = "Root Cause Analysis Results\n\n"
+        display_cols = ["candidate_variable", "normal_f_value", "abnormal_f_value",
+                        "change_rate", "propagation_lag", "composite_score"]
+        display_df = root_cause_df[display_cols].copy()
+        display_df.columns = ["Candidate", "Normal F", "Abnormal F", "Change Rate", "Prop Lag", "Score"]
+        info += display_df.to_string(index=False)
+
+        bar_fig = plot_root_cause_bar(root_cause_df)
+        timeline_fig = plot_anomaly_timeline(
+            state.anomaly_results, state.selected_cols,
+            target_var, root_cause_df, state.anomaly_method
+        )
+
+        candidates = root_cause_df["candidate_variable"].tolist()
+        default_candidate = candidates[0] if candidates else None
+
+        return info, bar_fig, timeline_fig, gr.update(choices=candidates, value=default_candidate), None
+    except Exception as e:
+        return f"Error in root cause analysis: {str(e)}", None, None, None, None
+
+
+def on_select_candidate_verification(candidate_var):
+    if state.root_cause_df is None or state.root_cause_segments is None:
+        return None, None
+
+    if not candidate_var or state.root_cause_target is None:
+        return None, None
+
+    try:
+        normal_df = state.root_cause_segments["normal_df"]
+        abnormal_df = state.root_cause_segments["abnormal_df"]
+        target_var = state.root_cause_target
+
+        scatter_fig = plot_scatter_compare(
+            normal_df, abnormal_df, candidate_var, target_var,
+            title_prefix="Root Cause"
+        )
+
+        ccf_fig = plot_cross_correlation_compare(
+            normal_df, abnormal_df, candidate_var, target_var,
+            max_lag=20, title_prefix="Root Cause"
+        )
+
+        return scatter_fig, ccf_fig
+    except Exception as e:
+        print(f"Verification plot error: {e}")
+        return None, None
 
 
 def _method_display_name(method_key):
@@ -1288,6 +1419,101 @@ def build_app():
                     fn=on_multiscale,
                     inputs=[ms_scales, ms_lag, ms_criterion],
                     outputs=[ms_info, ms_plot]
+                )
+
+            with gr.Tab("Anomaly Root Cause"):
+                with gr.Tabs():
+                    with gr.Tab("Step 1: Anomaly Detection"):
+                        with gr.Row():
+                            with gr.Column(scale=1):
+                                gr.Markdown("### Algorithm Parameters")
+                                with gr.Accordion("Z-score Sliding Window", open=True):
+                                    zscore_window = gr.Slider(10, 200, value=50, step=5, label="Window Size")
+                                    zscore_threshold = gr.Slider(1.0, 5.0, value=3.0, step=0.5, label="Threshold (σ)")
+                                with gr.Accordion("CUSUM Control Chart", open=True):
+                                    cusum_k = gr.Slider(0.1, 2.0, value=0.5, step=0.1, label="Allowance k (×σ)")
+                                    cusum_h = gr.Slider(1.0, 10.0, value=5.0, step=0.5, label="Decision Interval h (×σ)")
+                                with gr.Accordion("Isolation Forest", open=True):
+                                    if_contamination = gr.Slider(0.01, 0.2, value=0.05, step=0.01, label="Contamination Rate")
+                                anomaly_btn = gr.Button("Run Anomaly Detection", variant="primary")
+                                gr.Markdown("---")
+                                gr.Markdown("### Detection Method for Root Cause")
+                                anomaly_method = gr.Dropdown(
+                                    label="Select Method",
+                                    choices=[
+                                        ("Consensus (≥2 algorithms)", "consensus"),
+                                        ("Z-score (Sliding Window)", "zscore"),
+                                        ("CUSUM", "cusum"),
+                                        ("Isolation Forest", "iforest")
+                                    ],
+                                    value="consensus"
+                                )
+                                gr.Markdown("### Target Variable")
+                                rc_target_var = gr.Dropdown(label="Target Variable (anomalous)", choices=[], value=None)
+                            with gr.Column(scale=2):
+                                anomaly_info = gr.Textbox(label="Detection Summary", lines=10, interactive=False)
+                        with gr.Row():
+                            anomaly_scatter = gr.Plot(label="Anomaly Scatter Plot")
+                        with gr.Row():
+                            anomaly_summary_table = gr.Dataframe(label="Summary Table", interactive=False)
+
+                    with gr.Tab("Step 2: Root Cause Localization"):
+                        with gr.Row():
+                            with gr.Column(scale=1):
+                                gr.Markdown("### Root Cause Parameters")
+                                rc_window_size = gr.Slider(10, 100, value=30, step=5, label="Window Size (abnormal segment)")
+                                rc_max_lag = gr.Slider(1, 20, value=5, step=1, label="Max Lag for Granger")
+                                rc_criterion = gr.Dropdown(
+                                    label="Information Criterion",
+                                    choices=[("AIC", "aic"), ("BIC", "bic"), ("HQIC", "hqic")],
+                                    value="aic"
+                                )
+                                rc_btn = gr.Button("Run Root Cause Analysis", variant="primary")
+                            with gr.Column(scale=2):
+                                rc_info = gr.Textbox(label="Root Cause Ranking", lines=12, interactive=False)
+                        with gr.Row():
+                            rc_bar = gr.Plot(label="Composite Score Bar Chart")
+                        with gr.Row():
+                            rc_timeline = gr.Plot(label="Anomaly Propagation Timeline")
+
+                    with gr.Tab("Step 3: Visualization & Verification"):
+                        with gr.Row():
+                            with gr.Column(scale=1):
+                                gr.Markdown("### Interactive Verification")
+                                rc_candidate_select = gr.Dropdown(
+                                    label="Select Candidate Root Cause Variable",
+                                    choices=[], value=None
+                                )
+                                verify_btn = gr.Button("Show Verification Plots", variant="primary")
+                        with gr.Row():
+                            verify_scatter = gr.Plot(label="Scatter Comparison (Normal vs Abnormal)")
+                        with gr.Row():
+                            verify_ccf = gr.Plot(label="Cross-correlation Comparison")
+
+                anomaly_btn.click(
+                    fn=on_run_anomaly_detection,
+                    inputs=[zscore_window, zscore_threshold, cusum_k, cusum_h, if_contamination],
+                    outputs=[anomaly_info, anomaly_scatter, anomaly_summary_table, rc_target_var, rc_candidate_select]
+                )
+                anomaly_method.change(
+                    fn=on_change_anomaly_method,
+                    inputs=[anomaly_method],
+                    outputs=[anomaly_scatter]
+                )
+                rc_btn.click(
+                    fn=on_run_root_cause,
+                    inputs=[rc_target_var, rc_window_size, rc_max_lag, rc_criterion],
+                    outputs=[rc_info, rc_bar, rc_timeline, rc_candidate_select, verify_scatter]
+                )
+                rc_candidate_select.change(
+                    fn=on_select_candidate_verification,
+                    inputs=[rc_candidate_select],
+                    outputs=[verify_scatter, verify_ccf]
+                )
+                verify_btn.click(
+                    fn=on_select_candidate_verification,
+                    inputs=[rc_candidate_select],
+                    outputs=[verify_scatter, verify_ccf]
                 )
 
             with gr.Tab("Snapshot Compare"):
